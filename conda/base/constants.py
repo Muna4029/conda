@@ -382,3 +382,8 @@ NAMESPACES: Final = frozenset(NAMESPACES_MAP.values())
 # Indicates whether or not external plugins (i.e., plugins that aren't shipped
 # with conda) are enabled
 NO_PLUGINS: Final = False
+
+# Unicode marks for health checks
+OK_MARK: Final = "✅"
+X_MARK: Final = "❌"
+
