@@ -32,89 +32,129 @@ concurrency:
 env:
   # https://conda.github.io/conda-libmamba-solver/user-guide/configuration/#advanced-options
   CONDA_LIBMAMBA_SOLVER_NO_CHANNELS_FROM_INSTALLED: true
+  # focused testing or any needed pytest arguments, default empty
+  PYTEST_EXTRA: ''
 
 jobs:
   # detect whether any code changes are included in this PR
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     permissions:
       # necessary to detect changes
       # https://github.com/dorny/paths-filter#supported-workflows
       pull-requests: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      docs: ${{ steps.filter.outputs.docs }}
     steps:
       - name: Checkout Source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         # dorny/paths-filter needs git clone for non-PR events
         # https://github.com/dorny/paths-filter#supported-workflows
         if: github.event_name != 'pull_request'
 
       - name: Filter Changes
-        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           filters: |
             code:
               - 'conda/**'
-              - 'conda_env/**'
               - 'tests/**'
-              - '*.py'
               - 'recipe/**'
+              - '.github/workflows/benchmarks.yml'
+              - '.github/workflows/tests.yml'
+            docs:
+              - 'docs/source/_extensions/**'
+              - 'docs/build-assets/**'
+              - 'docs/source/user-guide/cheatsheet.rst'
+              - 'docs/source/user-guide/cheatsheets/**'
+              - 'docs/environment.yml'
+              - 'docs/pytest.ini'
+              - 'docs/tests/**'
               - '.github/workflows/tests.yml'
 
   # windows test suite
   windows:
     # only run test suite if there are code changes
     needs: changes
-    if: github.event_name == 'schedule' || needs.changes.outputs.code == 'true'
+    if: >-
+      (!github.event.repository.fork && github.event_name == 'schedule')
+      || needs.changes.outputs.code == 'true'
 
-    runs-on: windows-latest
+    runs-on: ${{ matrix.runs-on }}
+    defaults:
+      run:
+        shell: pwsh
     strategy:
       fail-fast: false
       matrix:
         # test lower version (w/ defaults) and upper version (w/ defaults and conda-forge)
-        python-version: ['3.9', '3.13']
+        runs-on: [windows-latest, windows-11-arm]
+        python-version: ['3.11', '3.15']
         default-channel: [defaults, conda-forge]
         test-type: [unit, integration]
         test-group: [1, 2, 3]
         exclude:
           - default-channel: conda-forge
-            python-version: '3.9'
+            python-version: '3.11'
           - test-type: unit
             test-group: 3
+          - runs-on: windows-11-arm
+            python-version: '3.11'
+        include:
+          - subdir: win-64
+          - runs-on: windows-11-arm
+            default-channel: conda-forge
+            subdir: win-arm64
     env:
       ErrorActionPreference: Stop  # powershell exit immediately on error
-      PYTEST_MARKER: ${{ matrix.test-type == 'unit' && 'not integration' || 'integration' }}
+      PYTEST_MARKER: ${{ matrix.test-type == 'unit' && 'not integration and not benchmark' || 'integration and not benchmark' }}
       PYTEST_SPLITS: ${{ matrix.test-type == 'unit' && '2' || '3' }}
-      REQUIREMENTS_TRUSTSTORE: ${{ contains('3.10|3.11|3.12|3.13', matrix.python-version) && '--file tests\requirements-truststore.txt' || '' }}
-      CONDA_TEST_SOLVERS: ${{ github.event_name == 'pull_request' && 'libmamba' || 'libmamba,classic' }}
+      CONDA_TEST_SOLVERS: ${{ (matrix.subdir == 'win-arm64' || github.event_name == 'pull_request') && 'rattler,libmamba' || 'rattler,libmamba,classic' }}
+      CONDA_TEST_SUBDIR: ${{ matrix.subdir }}
+      CONDA_REMOTE_MAX_RETRIES: 5
+      CONDA_REMOTE_BACKOFF_FACTOR: 2
 
     steps:
       - name: Checkout Source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Hash + Timestamp
         shell: bash  # use bash to run date command
-        run: echo "HASH=${{ runner.os }}-${{ runner.arch }}-Py${{ matrix.python-version }}-${{ matrix.default-channel }}-${{ matrix.test-type }}-${{ matrix.test-group }}-$(date -u "+%Y%m")" >> $GITHUB_ENV
+        run: |
+          STEM="${{ runner.os }}-${{ runner.arch }}-${{ matrix.subdir }}-Py${{ matrix.python-version }}-${{ matrix.default-channel }}-$(date -u "+%Y%m")"
+          echo "CACHE_KEY=${STEM}" >> $GITHUB_ENV
+          echo "HASH=${STEM}-${{ matrix.test-type }}-${{ matrix.test-group }}" >> $GITHUB_ENV
 
       - name: Cache Conda
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           # Use faster GNU tar for all runners
           enableCrossOsArchive: true
-          path: D:\conda_pkgs_dir
-          key: cache-${{ env.HASH }}
+          path: |
+            ~/conda_pkgs_dir/*.tar.bz2
+            ~/conda_pkgs_dir/*.conda
+          key: cache-${{ env.CACHE_KEY }}
 
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
+        uses: conda-incubator/setup-miniconda@be893c923ea9cf1cf7cd510fbdde27c7e18cbdcb # v4.1.0
         with:
           condarc-file: .github\condarc-${{ matrix.default-channel }}
           run-post: false  # skip post cleanup
-          pkgs-dirs: D:\conda_pkgs_dir
-          installation-dir: D:\conda
+          # Use x64 Miniconda to bootstrap the test environment until a native installer is available.
+          architecture: x64
+        env:
+          CONDA_SUBDIR: win-64
+
+      # Workaround: miniforge ships c-l-s 26.4.0 which has a sqlite locking bug.
+      # Remove once miniforge ships c-l-s >=26.4.1.
+      - name: Upgrade conda-libmamba-solver
+        run: conda install -n base --yes "conda-libmamba-solver>=26.4.1"
+        env:
+          CONDA_SUBDIR: win-64
 
       - name: Conda Install
         run: >
@@ -124,8 +164,9 @@ jobs:
           --file tests\requirements-${{ runner.os }}.txt
           --file tests\requirements-ci.txt
           --file tests\requirements-s3.txt
-          ${{ env.REQUIREMENTS_TRUSTSTORE }}
           python=${{ matrix.python-version }}
+        env:
+          CONDA_SUBDIR: ${{ matrix.subdir }}
 
       - name: Conda Info
         # view test env info (not base)
@@ -141,9 +182,10 @@ jobs:
         # for tests/shell, so only necessary for integration tests
         if: matrix.test-type == 'integration'
         run: |
-          $PWSH_STABLE = "$env:LOCALAPPDATA\Microsoft\powershell"
+          # Keep test installs separate from PowerShell's runtime cache.
+          $PWSH_STABLE = "$env:LOCALAPPDATA\conda-ci\powershell-stable"
           Invoke-Expression "& { $(Invoke-RestMethod https://aka.ms/install-powershell.ps1) } -Destination `"$PWSH_STABLE`""
-          $PWSH_PREVIEW = "$env:LOCALAPPDATA\Microsoft\powershell-preview"
+          $PWSH_PREVIEW = "$env:LOCALAPPDATA\conda-ci\powershell-preview"
           Invoke-Expression "& { $(Invoke-RestMethod https://aka.ms/install-powershell.ps1) } -Preview -Destination `"$PWSH_PREVIEW`""
           "PWSHPATH=$PWSH_STABLE;$PWSH_PREVIEW" | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -157,24 +199,26 @@ jobs:
       - name: Run Tests
         # Windows is sensitive to long paths, using `--basetemp=${{ runner.temp }} to
         # keep the test directories shorter
-        run: >
-          python -m pytest
-          --cov=conda
-          --basetemp=${{ runner.temp }}
-          --durations-path=durations\${{ runner.os }}.json
-          --group=${{ matrix.test-group }}
-          --splits=${{ env.PYTEST_SPLITS }}
-          -m "${{ env.PYTEST_MARKER }}"
+        run: |
+          $env:CONDA_EXE = "$env:CONDA_PREFIX\Scripts\conda.exe"
+          python -m pytest `
+          --cov=conda `
+          --basetemp=${{ runner.temp }} `
+          --durations-path=durations\${{ runner.os }}.json `
+          --group=${{ matrix.test-group }} `
+          --splits=${{ env.PYTEST_SPLITS }} `
+          -m "${{ env.PYTEST_MARKER }}" `
+          ${{ env.PYTEST_EXTRA }}
 
       - name: Upload Coverage
-        uses: codecov/codecov-action@18283e04ce6e62d37312384ff67231eb8fd56d24 # v5.4.3
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
-          flags: ${{ runner.os }},${{ runner.arch }},${{ matrix.python-version }},${{ matrix.test-type }}
+          flags: ${{ runner.os }},${{ runner.arch }},${{ matrix.subdir }},${{ matrix.python-version }},${{ matrix.test-type }}
           token: ${{ secrets.CODECOV_TOKEN }}  # required
 
       - name: Upload Test Results
         if: '!cancelled()'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-results-${{ env.HASH }}
           include-hidden-files: true
@@ -188,7 +232,9 @@ jobs:
   linux:
     # only run test suite if there are code changes
     needs: changes
-    if: github.event_name == 'schedule' || needs.changes.outputs.code == 'true'
+    if: >-
+      (!github.event.repository.fork && github.event_name == 'schedule')
+      || needs.changes.outputs.code == 'true'
 
     runs-on: ${{ matrix.runs-on }}
     defaults:
@@ -199,16 +245,14 @@ jobs:
       fail-fast: false
       matrix:
         # test all lower versions (w/ defaults) and upper version (w/ defaults and conda-forge)
-        runs-on: [ubuntu-latest, ubuntu-24.04-arm]
-        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+        runs-on:
+          - ubuntu-latest  # linux-64
+          - ubuntu-24.04-arm  # linux-aarch64
+        python-version: ['3.11', '3.12', '3.13', '3.14', '3.15']
         default-channel: [defaults, conda-forge]
         test-type: [unit, integration]
         test-group: [1, 2, 3]
         exclude:
-          - python-version: '3.9'
-            default-channel: conda-forge
-          - python-version: '3.10'
-            default-channel: conda-forge
           - python-version: '3.11'
             default-channel: conda-forge
           - python-version: '3.12'
@@ -216,39 +260,50 @@ jobs:
           - test-type: unit
             test-group: 3
           - runs-on: ubuntu-24.04-arm
-            python-version: '3.9'
-          - runs-on: ubuntu-24.04-arm
-            python-version: '3.10'
-          - runs-on: ubuntu-24.04-arm
             python-version: '3.11'
           - runs-on: ubuntu-24.04-arm
             python-version: '3.12'
     env:
-      PYTEST_MARKER: ${{ matrix.test-type == 'unit' && 'not integration' || 'integration' }}
+      PYTEST_MARKER: ${{ matrix.test-type == 'unit' && 'not integration and not benchmark' || 'integration and not benchmark' }}
       PYTEST_SPLITS: ${{ matrix.test-type == 'unit' && '2' || '3' }}
-      REQUIREMENTS_TRUSTSTORE: ${{ contains('3.10|3.11|3.12|3.13', matrix.python-version) && '--file tests/requirements-truststore.txt' || '' }}
-      CONDA_TEST_SOLVERS: ${{ github.event_name == 'pull_request' && ( matrix.python-version != '3.13' || matrix.default-channel == 'conda-forge' ) && 'libmamba' || 'libmamba,classic' }}
+      CONDA_TEST_SOLVERS: ${{ github.event_name == 'pull_request' && ( matrix.python-version != '3.15' || matrix.default-channel == 'conda-forge' ) && 'rattler,libmamba' || 'rattler,libmamba,classic' }}
+      CONDA_REMOTE_MAX_RETRIES: 5
+      CONDA_REMOTE_BACKOFF_FACTOR: 2
 
     steps:
       - name: Checkout Source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Hash + Timestamp
-        run: echo "HASH=${{ runner.os }}-${{ runner.arch }}-Py${{ matrix.python-version }}-${{ matrix.default-channel }}-${{ matrix.test-type }}-${{ matrix.test-group }}-$(date -u "+%Y%m")" >> $GITHUB_ENV
+        run: |
+          STEM="${{ runner.os }}-${{ runner.arch }}-Py${{ matrix.python-version }}-${{ matrix.default-channel }}-$(date -u "+%Y%m")"
+          echo "CACHE_KEY=${STEM}" >> $GITHUB_ENV
+          echo "HASH=${STEM}-${{ matrix.test-type }}-${{ matrix.test-group }}" >> $GITHUB_ENV
 
       - name: Cache Conda
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/conda_pkgs_dir
-          key: cache-${{ env.HASH }}
+          path: |
+            ~/conda_pkgs_dir/*.tar.bz2
+            ~/conda_pkgs_dir/*.conda
+          key: cache-${{ env.CACHE_KEY }}
 
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
+        uses: conda-incubator/setup-miniconda@be893c923ea9cf1cf7cd510fbdde27c7e18cbdcb # v4.1.0
         with:
           condarc-file: .github/condarc-${{ matrix.default-channel }}
           run-post: false  # skip post cleanup
+          miniconda-version: ${{ matrix.default-channel == 'defaults' && 'latest' || null }}
+          miniforge-version: ${{ matrix.default-channel == 'conda-forge' && 'latest' || null }}
+        timeout-minutes: 10
+
+      # Workaround: miniforge ships c-l-s 26.4.0 which has a sqlite locking bug.
+      # Remove once miniforge ships c-l-s >=26.4.1.
+      - name: Upgrade conda-libmamba-solver
+        run: conda install -n base --yes "conda-libmamba-solver>=26.4.1"
+        timeout-minutes: 10
 
       - name: Conda Install
         run: >
@@ -258,8 +313,8 @@ jobs:
           --file tests/requirements-${{ runner.os }}.txt
           --file tests/requirements-ci.txt
           --file tests/requirements-s3.txt
-          ${{ env.REQUIREMENTS_TRUSTSTORE }}
           python=${{ matrix.python-version }}
+        timeout-minutes: 10
 
       - name: Conda Info
         # view test env info (not base)
@@ -274,7 +329,29 @@ jobs:
       - name: Setup Shells
         # for tests/shell, so only necessary for integration tests
         if: matrix.test-type == 'integration'
-        run: sudo apt update && sudo apt install ash csh fish tcsh xonsh zsh
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          # The Ubuntu apt mirrors on the GitHub runners have hung for hours
+          # on rare occasions (the step normally runs in seconds), surviving
+          # apt's own retries. Bound each apt invocation with `timeout` so a
+          # stall fails fast: try the default runner mirror first, fall back
+          # to the canonical archive if that fails, and let the step fail
+          # otherwise.
+          apt_install_shells() {
+            sudo timeout --kill-after=30 300 apt-get update -o Acquire::Retries=3 &&
+              sudo timeout --kill-after=30 300 apt-get install -y \
+                --no-install-recommends -o Acquire::Retries=3 csh fish tcsh zsh
+          }
+          apt_install_shells || {
+            sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' \
+              /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+            apt_install_shells
+          }
+          # xonsh is installed with conda in step above
+          # Initialize all shells
+          python -m conda init --all
+        timeout-minutes: 30
 
       - name: Run Tests
         run: >
@@ -284,16 +361,18 @@ jobs:
           --group=${{ matrix.test-group }}
           --splits=${{ env.PYTEST_SPLITS }}
           -m "${{ env.PYTEST_MARKER }}"
+          ${{ env.PYTEST_EXTRA }}
+        timeout-minutes: 90
 
       - name: Upload Coverage
-        uses: codecov/codecov-action@18283e04ce6e62d37312384ff67231eb8fd56d24 # v5.4.3
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           flags: ${{ runner.os }},${{ runner.arch }},${{ matrix.python-version }},${{ matrix.test-type }}
           token: ${{ secrets.CODECOV_TOKEN }}  # required
 
       - name: Upload Test Results
         if: '!cancelled()'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-results-${{ env.HASH }}
           include-hidden-files: true
@@ -305,11 +384,15 @@ jobs:
 
   # linux benchmarks
   linux-benchmarks:
-    # only run test suite if there are code changes
+    # only run benchmarks if there are code changes
     needs: changes
     if: needs.changes.outputs.code == 'true'
 
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      PYTHONHASHSEED: '0'
     defaults:
       run:
         # https://github.com/conda-incubator/setup-miniconda#use-a-default-shell
@@ -317,30 +400,40 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.13']
-    env:
-      REQUIREMENTS_TRUSTSTORE: ${{ contains('3.10|3.11|3.12|3.13', matrix.python-version) && '--file tests/requirements-truststore.txt' || '' }}
+        python-version: ['3.15']
 
     steps:
       - name: Checkout Source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Hash + Timestamp
-        run: echo "HASH=${{ runner.os }}-${{ runner.arch }}-Py${{ matrix.python-version }}-benchmark-$(date -u "+%Y%m")" >> $GITHUB_ENV
+        run: |
+          STEM="${{ runner.os }}-${{ runner.arch }}-Py${{ matrix.python-version }}-$(date -u "+%Y%m")"
+          echo "CACHE_KEY=${STEM}-defaults-aux" >> $GITHUB_ENV
+          echo "HASH=${STEM}-benchmark" >> $GITHUB_ENV
 
       - name: Cache Conda
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/conda_pkgs_dir
-          key: cache-${{ env.HASH }}
+          path: |
+            ~/conda_pkgs_dir/*.tar.bz2
+            ~/conda_pkgs_dir/*.conda
+          key: cache-${{ env.CACHE_KEY }}
 
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
+        uses: conda-incubator/setup-miniconda@be893c923ea9cf1cf7cd510fbdde27c7e18cbdcb # v4.1.0
         with:
           condarc-file: .github/condarc-defaults
           run-post: false  # skip post cleanup
+
+      # Workaround: miniforge ships c-l-s 26.4.0 which has a sqlite locking bug.
+      # Remove once miniforge ships c-l-s >=26.4.1.
+      - name: Upgrade conda-libmamba-solver
+        run: conda install -n base --yes "conda-libmamba-solver>=26.4.1"
 
       - name: Conda Install
         run: >
@@ -350,9 +443,8 @@ jobs:
           --file tests/requirements-${{ runner.os }}.txt
           --file tests/requirements-ci.txt
           --file tests/requirements-s3.txt
-          --file tests/requirements-benchmarks.txt
-          ${{ env.REQUIREMENTS_TRUSTSTORE }}
           python=${{ matrix.python-version }}
+          "pytest-benchmark>=5.1.0"
 
       - name: Conda Info
         # view test env info (not base)
@@ -362,13 +454,146 @@ jobs:
         run: conda config --show-sources
 
       - name: Conda List
-        run: conda list --show-channel-urls
+        run: conda list --show-channel-urls | tee "$RUNNER_TEMP/benchmark_dependencies.txt"
+
+      - name: Install Bencher diagnostics
+        uses: bencherdev/bencher@7de3c69a85380826613050826b4bce062be2f07d # v0.6.16
+        with:
+          version: 0.6.12
+
+      - name: Record runner noise
+        continue-on-error: true
+        run: bencher noise --duration 30 --quiet | tee "$RUNNER_TEMP/noise.txt"
+
+      - name: Record benchmark runner
+        env:
+          HARNESS_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+
+          metadata = {
+              "runner": "ubuntu-24.04",
+              "image_os": os.environ["ImageOS"],
+              "image_version": os.environ["ImageVersion"],
+              "harness_sha": os.environ["HARNESS_SHA"],
+          }
+          Path(os.environ["RUNNER_TEMP"], "runner_metadata.json").write_text(json.dumps(metadata))
+
+      - name: Checkout Base Revision
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git checkout --detach "$BASE_SHA"
+          git restore --source "$HEAD_SHA" --worktree -- tests conda/testing pyproject.toml
+
+      - name: Run Base Benchmarks
+        if: github.event_name == 'pull_request'
+        id: baseline
+        continue-on-error: true
+        run: >
+          "$CONDA/envs/test/bin/python" -m pytest
+          -m benchmark
+          --benchmark-json "$RUNNER_TEMP/baseline_results.json"
+
+      - name: Discard Incomplete Base Results
+        if: github.event_name == 'pull_request' && steps.baseline.outcome != 'success'
+        run: rm -f "$RUNNER_TEMP/baseline_results.json"
+
+      - name: Checkout Head Revision
+        if: github.event_name == 'pull_request'
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git checkout --force --detach "$HEAD_SHA"
 
       - name: Run Benchmarks
-        uses: CodSpeedHQ/action@0010eb0ca6e89b80c88e8edaaa07cfe5f3e6664d # v3.5.0
+        run: >
+          "$CONDA/envs/test/bin/python" -m pytest
+          -m benchmark
+          --benchmark-json "$RUNNER_TEMP/benchmark_results.json"
+
+      - name: Record Workflow Event
+        run: cp "$GITHUB_EVENT_PATH" "$RUNNER_TEMP/event.json"
+
+      - name: Upload Benchmark Results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          token: ${{ secrets.CODSPEED_TOKEN }}
-          run: $CONDA/envs/test/bin/python -m pytest --codspeed
+          name: benchmark-results-v3
+          path: |
+            ${{ runner.temp }}/benchmark_results.json
+            ${{ runner.temp }}/baseline_results.json
+            ${{ runner.temp }}/runner_metadata.json
+            ${{ runner.temp }}/benchmark_dependencies.txt
+            ${{ runner.temp }}/noise.txt
+            ${{ runner.temp }}/event.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # linux docs
+  linux-docs:
+    # only run docs tests if the Sphinx extensions (or the data/assets/tests
+    # they depend on) changed; kept separate from the main test matrix so
+    # weasyprint and its native libraries are only installed here
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        # https://github.com/conda-incubator/setup-miniconda#use-a-default-shell
+        shell: bash -el {0}  # bash exit immediately on error + login shell
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Hash + Timestamp
+        run: |
+          STEM="${{ runner.os }}-${{ runner.arch }}-$(date -u "+%Y%m")"
+          echo "CACHE_KEY=${STEM}-conda-forge-docs" >> $GITHUB_ENV
+
+      - name: Cache Conda
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/conda_pkgs_dir/*.tar.bz2
+            ~/conda_pkgs_dir/*.conda
+          key: cache-${{ env.CACHE_KEY }}
+
+      - name: Setup Miniconda
+        # docs/environment.yml is resolved against conda-forge (as on Read the Docs)
+        uses: conda-incubator/setup-miniconda@be893c923ea9cf1cf7cd510fbdde27c7e18cbdcb # v4.1.0
+        with:
+          condarc-file: .github/condarc-conda-forge
+          miniforge-version: latest
+          # docs/environment.yml holds both the docs build and docs test
+          # dependencies so everything lives in a single (activated) environment
+          activate-environment: docs
+          environment-file: docs/environment.yml
+          run-post: false  # skip post cleanup
+        timeout-minutes: 15
+
+      - name: Conda Info
+        # view docs env info (not base)
+        run: conda info --verbose
+
+      - name: Conda Config
+        run: conda config --show-sources
+
+      - name: Conda List
+        run: conda list --show-channel-urls
+
+      - name: Run Docs Tests
+        # uses docs/pytest.ini, not the project pytest settings in pyproject.toml
+        run: python -m pytest
+        working-directory: docs
+        timeout-minutes: 15
 
   # linux typing
   linux-typing:
@@ -376,7 +601,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
 
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     defaults:
       run:
         # https://github.com/conda-incubator/setup-miniconda#use-a-default-shell
@@ -384,30 +609,38 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.13']
-    env:
-      REQUIREMENTS_TRUSTSTORE: ${{ contains('3.10|3.11|3.12|3.13', matrix.python-version) && '--file tests/requirements-truststore.txt' || '' }}
+        python-version: ['3.15']
 
     steps:
       - name: Checkout Source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Hash + Timestamp
-        run: echo "HASH=${{ runner.os }}-${{ runner.arch }}-Py${{ matrix.python-version }}-benchmark-$(date -u "+%Y%m")" >> $GITHUB_ENV
+        run: |
+          STEM="${{ runner.os }}-${{ runner.arch }}-Py${{ matrix.python-version }}-$(date -u "+%Y%m")"
+          echo "CACHE_KEY=${STEM}-defaults-aux" >> $GITHUB_ENV
+          echo "HASH=${STEM}-typing" >> $GITHUB_ENV
 
       - name: Cache Conda
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/conda_pkgs_dir
-          key: cache-${{ env.HASH }}
+          path: |
+            ~/conda_pkgs_dir/*.tar.bz2
+            ~/conda_pkgs_dir/*.conda
+          key: cache-${{ env.CACHE_KEY }}
 
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
+        uses: conda-incubator/setup-miniconda@be893c923ea9cf1cf7cd510fbdde27c7e18cbdcb # v4.1.0
         with:
           condarc-file: .github/condarc-defaults
           run-post: false  # skip post cleanup
+
+      # Workaround: miniforge ships c-l-s 26.4.0 which has a sqlite locking bug.
+      # Remove once miniforge ships c-l-s >=26.4.1.
+      - name: Upgrade conda-libmamba-solver
+        run: conda install -n base --yes "conda-libmamba-solver>=26.4.1"
 
       - name: Conda Install
         run: >
@@ -418,7 +651,6 @@ jobs:
           --file tests/requirements-ci.txt
           --file tests/requirements-s3.txt
           --file tests/requirements-typing.txt
-          ${{ env.REQUIREMENTS_TRUSTSTORE }}
           python=${{ matrix.python-version }}
 
       - name: Conda Info
@@ -441,7 +673,7 @@ jobs:
 
       - name: Upload Coverage
         if: '!cancelled()'
-        uses: codecov/codecov-action@18283e04ce6e62d37312384ff67231eb8fd56d24 # v5.4.3
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           flags: ${{ runner.os }},${{ runner.arch }},${{ matrix.python-version }},MyPy
           token: ${{ secrets.CODECOV_TOKEN }}  # required
@@ -449,7 +681,7 @@ jobs:
 
       - name: Upload Test Results
         if: '!cancelled()'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-results-${{ env.HASH }}
           include-hidden-files: true
@@ -463,7 +695,9 @@ jobs:
   linux-qemu:
     # only run test suite if there are code changes
     needs: changes
-    if: github.event_name == 'schedule' || needs.changes.outputs.code == 'true'
+    if: >-
+      (!github.event.repository.fork && github.event_name == 'schedule')
+      || needs.changes.outputs.code == 'true'
 
     # Run one single fast test per docker+qemu emulated linux platform to test that
     # test execution is possible there (container+tools+dependencies work). Can be
@@ -478,25 +712,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.13']
+        python-version: ['3.15']
         image:
           - condaforge/miniforge3:latest
         platform: [ppc64le]
 
     steps:
       - name: Checkout Source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Setup QEMU
-        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: linux/${{ matrix.platform }}
-          # TODO: remove once resolved upstream:
-          # - https://github.com/tonistiigi/binfmt/issues/215
-          # - https://github.com/tonistiigi/binfmt/issues/165
-          image: tonistiigi/binfmt:qemu-v8.1.5
 
       - name: Run Tests
         run: >
@@ -536,28 +766,38 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.13']
+        python-version: ['3.15']
 
     steps:
       - name: Checkout Source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Hash + Timestamp
-        run: echo "HASH=${{ runner.os }}-${{ runner.arch }}-Py${{ matrix.python-version }}-memray-$(date -u "+%Y%m")" >> $GITHUB_ENV
+        run: |
+          STEM="${{ runner.os }}-${{ runner.arch }}-Py${{ matrix.python-version }}-$(date -u "+%Y%m")"
+          echo "CACHE_KEY=${STEM}-defaults-aux" >> $GITHUB_ENV
+          echo "HASH=${STEM}-memray" >> $GITHUB_ENV
 
       - name: Cache Conda
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/conda_pkgs_dir
-          key: cache-${{ env.HASH }}
+          path: |
+            ~/conda_pkgs_dir/*.tar.bz2
+            ~/conda_pkgs_dir/*.conda
+          key: cache-${{ env.CACHE_KEY }}
 
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
+        uses: conda-incubator/setup-miniconda@be893c923ea9cf1cf7cd510fbdde27c7e18cbdcb # v4.1.0
         with:
           condarc-file: .github/condarc-defaults
           run-post: false  # skip post cleanup
+
+      # Workaround: miniforge ships c-l-s 26.4.0 which has a sqlite locking bug.
+      # Remove once miniforge ships c-l-s >=26.4.1.
+      - name: Upgrade conda-libmamba-solver
+        run: conda install -n base --yes "conda-libmamba-solver>=26.4.1"
 
       - name: Conda Install
         run: >
@@ -567,7 +807,6 @@ jobs:
           --file tests/requirements-${{ runner.os }}.txt
           --file tests/requirements-ci.txt
           --file tests/requirements-s3.txt
-          --file tests/requirements-truststore.txt
           python=${{ matrix.python-version }}
           conda-forge::pytest-memray
 
@@ -588,9 +827,11 @@ jobs:
   macos:
     # only run test suite if there are code changes
     needs: changes
-    if: github.event_name == 'schedule' || needs.changes.outputs.code == 'true'
+    if: >-
+      (!github.event.repository.fork && github.event_name == 'schedule')
+      || needs.changes.outputs.code == 'true'
 
-    runs-on: ${{ (matrix.arch == 'osx-64' && 'macos-13') || 'macos-14' }}
+    runs-on: ${{ matrix.runs-on }}
     defaults:
       run:
         # https://github.com/conda-incubator/setup-miniconda#use-a-default-shell
@@ -598,57 +839,68 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # test lower version (w/ osx-64 & defaults & unit tests) and upper version (w/ osx-arm64 & conda-forge & integration tests)
-        arch: [osx-64, osx-arm64]
-        python-version: ['3.9', '3.13']
+        # test lower version (w/ osx-64 & defaults & unit tests) and upper version (w/ osx-arm64 & defaults & integration tests)
+        runs-on:
+          - macos-15-intel  # osx-64
+          - macos-latest  # osx-arm64
+        python-version: ['3.11', '3.15']
         default-channel: [defaults, conda-forge]
         test-type: [unit, integration]
         test-group: [1, 2, 3]
         exclude:
-          - arch: osx-64
-            python-version: '3.13'
-          - arch: osx-64
-            default-channel: conda-forge
-          - arch: osx-64
-            test-type: integration
-          - arch: osx-arm64
-            python-version: '3.9'
-          - arch: osx-arm64
+          - runs-on: macos-15-intel
+            python-version: '3.15'
+          - runs-on: macos-15-intel
             default-channel: defaults
-          - arch: osx-arm64
+          - runs-on: macos-15-intel
+            test-type: integration
+          - runs-on: macos-latest
+            python-version: '3.11'
+          - runs-on: macos-latest
+            default-channel: conda-forge
+          - runs-on: macos-latest
             test-type: unit
           - test-type: unit
             test-group: 3
     env:
-      PYTEST_MARKER: ${{ matrix.test-type == 'unit' && 'not integration' || 'integration' }}
+      PYTEST_MARKER: ${{ matrix.test-type == 'unit' && 'not integration and not benchmark' || 'integration and not benchmark' }}
       PYTEST_SPLITS: ${{ matrix.test-type == 'unit' && '2' || '3' }}
-      REQUIREMENTS_TRUSTSTORE: ${{ contains('3.10|3.11|3.12|3.13', matrix.python-version) && '--file tests/requirements-truststore.txt' || '' }}
-      CONDA_TEST_SOLVERS: ${{ github.event_name == 'pull_request' && 'libmamba' || 'libmamba,classic' }}
+      CONDA_TEST_SOLVERS: ${{ github.event_name == 'pull_request' && 'rattler,libmamba' || 'rattler,libmamba,classic' }}
+      CONDA_REMOTE_MAX_RETRIES: 5
+      CONDA_REMOTE_BACKOFF_FACTOR: 2
 
     steps:
       - name: Checkout Source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Hash + Timestamp
-        run: echo "HASH=${{ runner.os }}-${{ runner.arch }}-Py${{ matrix.python-version }}-${{ matrix.default-channel }}-${{ matrix.test-type }}-${{ matrix.test-group }}-$(date -u "+%Y%m")" >> $GITHUB_ENV
+        run: |
+          STEM="${{ runner.os }}-${{ runner.arch }}-Py${{ matrix.python-version }}-${{ matrix.default-channel }}-$(date -u "+%Y%m")"
+          echo "CACHE_KEY=${STEM}" >> $GITHUB_ENV
+          echo "HASH=${STEM}-${{ matrix.test-type }}-${{ matrix.test-group }}" >> $GITHUB_ENV
 
       - name: Cache Conda
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/conda_pkgs_dir
-          key: cache-${{ env.HASH }}
+          path: |
+            ~/conda_pkgs_dir/*.tar.bz2
+            ~/conda_pkgs_dir/*.conda
+          key: cache-${{ env.CACHE_KEY }}
 
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
+        uses: conda-incubator/setup-miniconda@be893c923ea9cf1cf7cd510fbdde27c7e18cbdcb # v4.1.0
         with:
           condarc-file: .github/condarc-${{ matrix.default-channel }}
           run-post: false  # skip post cleanup
-          # conda not preinstalled in arm64 runners
-          miniconda-version: ${{ (matrix.default-channel == 'defaults' && matrix.arch == 'osx-arm64') && 'latest' || null }}
-          miniforge-version: ${{ (matrix.default-channel == 'conda-forge' && matrix.arch == 'osx-arm64') && 'latest' || null }}
-          architecture: ${{ runner.arch }}
+          miniconda-version: ${{ matrix.default-channel == 'defaults' && 'latest' || null }}
+          miniforge-version: ${{ matrix.default-channel == 'conda-forge' && 'latest' || null }}
+
+      # Workaround: miniforge ships c-l-s 26.4.0 which has a sqlite locking bug.
+      # Remove once miniforge ships c-l-s >=26.4.1.
+      - name: Upgrade conda-libmamba-solver
+        run: conda install -n base --yes "conda-libmamba-solver>=26.4.1"
 
       - name: Conda Install
         run: >
@@ -657,7 +909,6 @@ jobs:
           --file tests/requirements.txt
           --file tests/requirements-ci.txt
           --file tests/requirements-s3.txt
-          ${{ env.REQUIREMENTS_TRUSTSTORE }}
           python=${{ matrix.python-version }}
 
       - name: Conda Info
@@ -674,6 +925,7 @@ jobs:
         # for tests/shell, so only necessary for integration tests
         if: matrix.test-type == 'integration'
         run: brew update && brew install fish xonsh
+        timeout-minutes: 10
 
       - name: Run Tests
         run: >
@@ -683,16 +935,17 @@ jobs:
           --group=${{ matrix.test-group }}
           --splits=${{ env.PYTEST_SPLITS }}
           -m "${{ env.PYTEST_MARKER }}"
+          ${{ env.PYTEST_EXTRA }}
 
       - name: Upload Coverage
-        uses: codecov/codecov-action@18283e04ce6e62d37312384ff67231eb8fd56d24 # v5.4.3
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           flags: ${{ runner.os }},${{ runner.arch }},${{ matrix.python-version }},${{ matrix.test-type }}
           token: ${{ secrets.CODECOV_TOKEN }}  # required
 
       - name: Upload Test Results
         if: '!cancelled()'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-results-${{ env.HASH }}
           include-hidden-files: true
@@ -709,18 +962,18 @@ jobs:
     if: >-
       !cancelled()
       && (
-        github.event_name == 'schedule'
+        (!github.event.repository.fork && github.event_name == 'schedule')
         || needs.changes.outputs.code == 'true'
       )
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - name: Download Artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
 
       - name: Upload Combined Test Results
         # provides one downloadable archive of all matrix run test results for further analysis
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-results-${{ github.sha }}-all
           include-hidden-files: true
@@ -728,125 +981,152 @@ jobs:
           retention-days: 7  # for durations.yml workflow
 
       - name: Test Summary
-        uses: test-summary/action@31493c76ec9e7aa675f1585d3ed6f1da69269a86 # v2.4
+        uses: test-summary/action@37b508cfee6d4d080eedd00b5bb240a6a784a6a5 # v2.6
         with:
           paths: test-results-*/test-report.xml
 
   # required check
   analyze:
-    needs: [windows, linux, linux-qemu, linux-benchmarks, macos, aggregate]
+    needs: [windows, linux, linux-docs, linux-qemu, linux-benchmarks, macos, aggregate]
     if: '!cancelled()'
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - name: Determine Success
-        uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
         id: alls-green
         with:
           # permit jobs to be skipped if there are no code changes (see changes job)
           allowed-skips: ${{ toJSON(needs) }}
           jobs: ${{ toJSON(needs) }}
 
-      - name: Checkout our source
-        if: always() && github.event_name == 'schedule' && steps.alls-green.outputs.result == 'failure'
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
       - name: Report failures
-        if: always() && github.event_name == 'schedule' && steps.alls-green.outputs.result == 'failure'
-        uses: JasonEtco/create-an-issue@1b14a70e4d8dc185e5cc76d3bec9eab20257b2c5 # v2.9.2
+        if: >-
+          always()
+          && github.event_name == 'schedule'
+          && steps.alls-green.outputs.result == 'failure'
         env:
-          GITHUB_TOKEN: ${{ secrets.AUTO_REPORT_TEST_FAILURE }}
-          RUN_ID: ${{ github.run_id }}
-          TITLE: Tests failed
-        with:
-          filename: .github/TEST_FAILURE_REPORT_TEMPLATE.md
-          update_existing: false
-
-  # canary builds
-  build:
-    needs: [analyze]
-    # only build canary build if
-    # - prior steps succeeded,
-    # - this is the main repo, and
-    # - we are on the main, feature, or release branch
-    if: >-
-      !cancelled()
-      && !github.event.repository.fork
-      && (
-        github.ref_name == 'main'
-        || startsWith(github.ref_name, 'feature/')
-        || endsWith(github.ref_name, '.x')
-      )
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            subdir: linux-64
-          - runner: macos-13
-            subdir: osx-64
-          - runner: macos-latest
-            subdir: osx-arm64
-          - runner: windows-latest
-            subdir: win-64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      # Clean checkout of specific git ref needed for package metadata version
-      # which needs env vars GIT_DESCRIBE_TAG and GIT_BUILD_STR:
-      - name: Checkout Source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ github.ref }}
-          clean: true
-          fetch-depth: 0
-
-      # Explicitly use Python 3.11 since each of the OSes has a different default Python
-      - name: Setup Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: '3.11'
-
-      - name: Detect Label
-        shell: python
+          GH_TOKEN: ${{ secrets.AUTO_REPORT_TEST_FAILURE }}
         run: |
-          import re
-          from pathlib import Path
-          from os import environ
-          from subprocess import check_output
+          DAY=$(date -u '+%Y-%m-%d')
+          TITLE="${{ github.workflow }} failed (${DAY})"
+          BODY="The ${{ github.workflow }} workflow failed at $(date -u '+%Y-%m-%d %H:%M') UTC
 
-          # unless otherwise specified, commits are uploaded to the dev label
-          # e.g., `main` branch commits
-          envs = {"ANACONDA_ORG_LABEL": "dev"}
+          Full run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          existing=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --search "\"${TITLE}\" in:title label:source::auto sort:created-desc" \
+            --limit 1 \
+            --json number \
+            --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" \
+              --repo "${{ github.repository }}" \
+              --body "$BODY"
+          else
+            gh issue create \
+              --repo "${{ github.repository }}" \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --label "¡blocking!,type::bug,type::testing,source::auto"
+          fi
 
-          if "${{ github.ref_name }}".startswith("feature/"):
-              # feature branch commits are uploaded to a custom label
-              envs["ANACONDA_ORG_LABEL"] = "${{ github.ref_name }}"
-          elif re.match(r"\d+(\.\d+)+\.x", "${{ github.ref_name }}"):
-              # release branch commits are added to the rc label
-              # see https://github.com/conda/infrastructure/issues/760
-              _, name = "${{ github.repository }}".split("/")
-              envs["ANACONDA_ORG_LABEL"] = f"rc-{name}-${{ github.ref_name }}"
+  # check conda-build imports
+  downstream:
+    # only run test suite if there are code changes
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
 
-              # if no releases have occurred on this branch yet then `git describe --tag`
-              # will misleadingly produce a version number relative to the last release
-              # and not relative to the current release branch, if this is the case we need
-              # to override the version with a derivative of the branch name
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # https://github.com/conda-incubator/setup-miniconda#use-a-default-shell
+        shell: bash -el {0}  # bash exit immediately on error + login shell
+    strategy:
+      fail-fast: false
+      matrix:
+        # check missing imports in one representative environment
+        python-version: ['3.15']
+        default-channel: [defaults]
 
-              # override the version if `git describe --tag` does not start with the branch version
-              last_release = check_output(["git", "describe", "--tag"], text=True).strip()
-              prefix = "${{ github.ref_name }}"[:-1]  # without x suffix
-              if not last_release.startswith(prefix):
-                  envs["VERSION_OVERRIDE"] = f"{prefix}0"
-
-          Path(environ["GITHUB_ENV"]).write_text("\n".join(f"{name}={value}" for name, value in envs.items()))
-
-      - name: Create & Upload
-        uses: conda/actions/canary-release@eb545bb8ab48d499b31c057a6df3cf46753fdbcb # v25.3.1
-        env:
-          # Run conda-build in isolated activation to properly package conda
-          _CONDA_BUILD_ISOLATED_ACTIVATION: 1
+    steps:
+      - name: Checkout conda/conda
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          package-name: ${{ github.event.repository.name }}
-          subdir: ${{ matrix.subdir }}
-          anaconda-org-channel: conda-canary
-          anaconda-org-label: ${{ env.ANACONDA_ORG_LABEL }}
-          anaconda-org-token: ${{ secrets.ANACONDA_ORG_CONDA_CANARY_TOKEN }}
+          fetch-depth: 0
+          repository: conda/conda
+          path: conda
+
+      - name: Checkout conda/conda-build
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          repository: conda/conda-build
+          path: conda-build
+
+      - name: Hash + Timestamp + Job
+        run: |
+          STEM="${{ runner.os }}-${{ runner.arch }}-Py${{ matrix.python-version }}-$(date -u "+%Y%m")"
+          echo "CACHE_KEY=${STEM}-defaults-aux" >> $GITHUB_ENV
+          echo "HASH=${STEM}-${{ matrix.default-channel }}-${{ github.job }}" >> $GITHUB_ENV
+
+      - name: Cache Conda
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/conda_pkgs_dir/*.tar.bz2
+            ~/conda_pkgs_dir/*.conda
+          key: cache-${{ env.CACHE_KEY }}
+
+      - name: Setup Miniconda
+        uses: conda-incubator/setup-miniconda@be893c923ea9cf1cf7cd510fbdde27c7e18cbdcb # v4.1.0
+        with:
+          condarc-file: conda/.github/condarc-${{ matrix.default-channel }}
+          run-post: false  # skip post cleanup
+
+      # Workaround: miniforge ships c-l-s 26.4.0 which has a sqlite locking bug.
+      # Remove once miniforge ships c-l-s >=26.4.1.
+      - name: Upgrade conda-libmamba-solver
+        run: conda install -n base --yes "conda-libmamba-solver>=26.4.1"
+
+      - name: Conda Install
+        working-directory: conda
+        run: >
+          conda install
+          --yes
+          --file tests/requirements.txt
+          --file tests/requirements-${{ runner.os }}.txt
+          --file tests/requirements-ci.txt
+          --file tests/requirements-s3.txt
+          --file ../conda-build/tests/requirements.txt
+          --file ../conda-build/tests/requirements-ci.txt
+          --file ../conda-build/tests/requirements-${{ runner.os }}.txt
+          python=${{ matrix.python-version }}
+
+      - name: Install conda, conda-build source code
+        env:
+          PIP_NO_BUILD_ISOLATION: '1'
+        run: |
+          python -m pip install -e conda -e conda-build -v --no-deps
+
+      - name: Conda Info
+        run: python -m conda info --verbose
+
+      - name: Conda Config
+        run: python -m conda config --show-sources
+
+      - name: Conda List
+        run: python -m conda list --show-channel-urls
+
+      - name: Check correct conda, conda-build installed
+        run: python -c "import conda, conda_build; print(conda.__file__, conda_build.__file__)"
+
+      - name: Check conda-build tests for missing imports
+        working-directory: conda-build
+        # This test looks for ImportError, not warnings-promoted-to-error. The
+        # inline script removes the filterwarnings section from pyproject.toml.
+        # I wasn't able to find a pytest command line argument to do the same.
+        run: |
+          python -c "import re, sys, pathlib; pyproject = pathlib.Path('pyproject.toml'); pyproject.write_text(re.sub('(filterwarnings.*?])', '', pyproject.read_text(), flags=re.MULTILINE | re.DOTALL))"
+          python -m pytest --collect-only
